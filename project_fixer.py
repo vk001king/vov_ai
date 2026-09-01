@@ -133,7 +133,6 @@ CONTENT:
 
         filename = file_match.group(1).strip()
 
-        # Security: prevent path traversal
         if (
             ".." in filename
             or filename.startswith("/")
@@ -190,7 +189,7 @@ CONTENT:
             encoding="utf-8"
         )
 
-        fixed_files.append(filename)
+        fixed_files.append(filename) 
 
     # -----------------------------------------
     # FINAL TEST
