@@ -1,603 +1,486 @@
+"""
+VOV AI - Ollama engine.
+
+Fixes over the original:
+  * Model names are resolved against what is actually installed,
+    so a missing pull degrades to a working model instead of a 404.
+  * think=True is negotiated, not assumed (older models reject it).
+  * Conversation history is supported.
+  * Images (vision) are supported and auto-route to a multimodal model.
+  * Every failure path returns a readable message instead of a traceback.
+"""
+
+import threading
+import time
+from typing import Dict, Generator, List, Optional
+
 import ollama
 
+import config
 
-# ============================================================
-# MODEL CONFIGURATION
-# ============================================================
+# ------------------------------------------------------------------
+# Client
+# ------------------------------------------------------------------
 
-CHAT_MODEL = "qwen2.5:3b" 
+_client = ollama.Client(host=config.OLLAMA_HOST)
 
-FAST_MODEL = "qwen3.5-4b:latest" 
+_model_cache: Dict[str, object] = {"at": 0.0, "models": []}
+_cache_lock = threading.Lock()
 
-POWERFUL_MODEL = "qwen3.5:latest"
-
-
-# ============================================================
-# MODEL ALIASES
-# ============================================================
-
-MODEL_ALIASES = {
-
-    "qwen2.5": CHAT_MODEL,
-    "qwen2.5:3b": CHAT_MODEL,
-
-    "qwen3.5-4b": FAST_MODEL,
-    "qwen3.5-4b:latest": FAST_MODEL,
-
-    "qwen3.5": POWERFUL_MODEL,
-    "qwen3.5:latest": POWERFUL_MODEL,
-}
+# Models known to reject the `think` parameter, learned at runtime.
+_no_think: set = set()
 
 
-# ============================================================
-# SYSTEM PROMPT
-# ============================================================
+# ------------------------------------------------------------------
+# System prompt
+# ------------------------------------------------------------------
 
-SYSTEM_PROMPT = """
-You are VOV AI.
+SYSTEM_PROMPT = """You are VOV AI, a local AI assistant and software development agent
+running through Ollama.
 
-You are a powerful local AI assistant and software development agent.
+You help users:
+- answer questions and explain concepts
+- write, debug and fix code
+- build complete websites and applications
+- modify and improve existing projects
 
-Your main purpose is to help users:
-
-- Answer questions
-- Explain concepts
-- Write code
-- Debug code
-- Fix errors
-- Build complete websites
-- Build complete applications
-- Create Python programs
-- Create JavaScript applications
-- Create React applications
-- Modify existing projects
-- Improve existing projects
-- Generate project files
-- Improve UI and UX
-- Design modern interfaces
-- Work with project files
-- Continue previous work
-
-IMPORTANT RULES:
-
-1. Understand the user's request before responding.
-
-2. Give useful and direct answers.
-
-3. If the user asks to modify an existing project, preserve existing
-   functionality unless the user explicitly asks to remove it.
-
-4. Do not unnecessarily rewrite working code.
-
-5. When generating software, create complete functional code.
-
-6. When the user specifies a programming language, ALWAYS use that language.
-
-7. If the user does not specify a language, choose the most suitable
-   technology automatically.
-
-8. If the user asks for a website:
-   - Use HTML
-   - CSS
-   - JavaScript
-   unless another framework is requested.
-
-9. If the user asks for React, use React.
-
-10. If the user asks for Python, use Python.
-
-11. When modifying code, carefully preserve existing features.
-
-12. Do not create fake functionality.
-
-13. Do not use placeholders such as:
-    TODO
-    YOUR CODE HERE
-    ADD CODE HERE
-
-14. Do not expose private chain-of-thought or hidden reasoning.
-
-15. If thinking is enabled, only provide a short useful progress summary.
-
-16. You are a local AI running through Ollama.
-
-You are VOV AI.
+Rules:
+1. Understand the request before answering. Be direct and useful.
+2. When the user names a language or framework, always use it.
+3. If none is named, choose the most suitable option yourself.
+4. For plain websites use HTML, CSS and JavaScript unless told otherwise.
+5. When modifying a project, preserve existing functionality and design
+   unless the user explicitly asks you to change it.
+6. Never write placeholders such as TODO, YOUR CODE HERE, or ADD CODE HERE.
+   Write complete, working code.
+7. Never invent fake functionality or dead buttons.
+8. Format code in fenced markdown blocks with a language tag.
+9. Do not expose hidden reasoning. Keep any progress notes short.
 """
 
 
-# ============================================================
-# KEYWORDS
-# ============================================================
+# ------------------------------------------------------------------
+# Routing keywords
+# ------------------------------------------------------------------
 
 CODING_KEYWORDS = [
-
-    "code",
-    "coding",
-    "program",
-    "programming",
-
-    "website",
-    "web app",
-    "web application",
-
-    "application",
-    "app",
-
-    "software",
-
-    "python",
-    "javascript",
-    "typescript",
-
-    "react",
-    "reactjs",
-    "nextjs",
-    "next.js",
-
-    "html",
-    "css",
-
-    "api",
-    "backend",
-    "frontend",
-
-    "fastapi",
-    "flask",
-    "django",
-
-    "node",
-    "nodejs",
-
-    "database",
-    "sql",
-
-    "debug",
-    "debugging",
-    "bug",
-    "error",
-
-    "fix",
-
-    "build",
-    "create",
-    "develop",
-
-    "project",
-
-    "component",
-    "function",
-    "class",
-
-    "algorithm",
-
-    "github",
-
+    "code", "coding", "program", "programming", "script",
+    "website", "web app", "web application", "application", "app",
+    "software", "python", "javascript", "typescript", "react",
+    "reactjs", "nextjs", "next.js", "vue", "svelte", "html", "css",
+    "tailwind", "api", "backend", "frontend", "fastapi", "flask",
+    "django", "express", "node", "nodejs", "database", "sql",
+    "sqlite", "postgres", "mongodb", "debug", "debugging", "bug",
+    "error", "exception", "traceback", "fix", "refactor", "build",
+    "create", "develop", "deploy", "project", "component",
+    "function", "class", "algorithm", "regex", "git", "github",
+    "docker", "test", "unit test",
 ]
-
-
-# ============================================================
-# COMPLEX REQUEST KEYWORDS
-# ============================================================
 
 COMPLEX_KEYWORDS = [
-
-    "full stack",
-    "full-stack",
-
-    "complete application",
-    "complete app",
-
-    "complete website",
-
-    "build an app",
-    "build a website",
-    "build application",
-
-    "generate project",
-    "create project",
-
-    "large project",
-    "complex project",
-
-    "architecture",
-
-    "authentication",
-    "authorization",
-
-    "database",
-
-    "api integration",
-
-    "backend",
-    "frontend",
-
-    "dashboard",
-
-    "admin panel",
-
-    "ecommerce",
-    "e-commerce",
-
-    "login system",
-
-    "signup system",
-
+    "full stack", "full-stack", "complete application", "complete app",
+    "complete website", "build an app", "build a website",
+    "build application", "generate project", "create project",
+    "large project", "complex project", "architecture", "microservice",
+    "authentication", "authorization", "database", "api integration",
+    "backend", "frontend", "dashboard", "admin panel", "ecommerce",
+    "e-commerce", "login system", "signup system", "payment",
+    "real time", "realtime", "websocket", "multi page", "multipage",
 ]
 
 
-# ============================================================
-# CHECK CODING REQUEST
-# ============================================================
-
-def is_coding_request(prompt):
-
+def is_coding_request(prompt: str) -> bool:
     text = str(prompt).lower()
-
-    return any(
-        keyword in text
-        for keyword in CODING_KEYWORDS
-    )
+    return any(word in text for word in CODING_KEYWORDS)
 
 
-# ============================================================
-# CHECK COMPLEX REQUEST
-# ============================================================
-
-def is_complex_request(prompt):
-
+def is_complex_request(prompt: str) -> bool:
     text = str(prompt).lower()
-
-    return any(
-        keyword in text
-        for keyword in COMPLEX_KEYWORDS
-    )
+    return any(word in text for word in COMPLEX_KEYWORDS)
 
 
-# ============================================================
-# AUTOMATIC MODEL SELECTION
-# ============================================================
+# ------------------------------------------------------------------
+# Installed models
+# ------------------------------------------------------------------
 
-def select_model(prompt, requested_model="auto"):
+def installed_models(force: bool = False) -> List[str]:
+    """Names of every model installed in Ollama. Cached briefly."""
 
-    # --------------------------------------------------------
-    # NORMALIZE REQUESTED MODEL
-    # --------------------------------------------------------
+    with _cache_lock:
+        fresh = (time.time() - float(_model_cache["at"])) < config.MODEL_CACHE_TTL
 
-    requested_model = (
-        requested_model or "auto"
-    ).lower().strip()
+        if not force and fresh and _model_cache["models"]:
+            return list(_model_cache["models"])  # type: ignore[arg-type]
 
-
-    # --------------------------------------------------------
-    # EXPLICIT MODEL
-    # --------------------------------------------------------
-
-    if requested_model != "auto":
-
-        if requested_model in MODEL_ALIASES:
-
-            return MODEL_ALIASES[
-                requested_model
-            ]
-
-        return requested_model
-
-
-    # --------------------------------------------------------
-    # AUTO MODEL SELECTION
-    # --------------------------------------------------------
-
-    # Complex software projects
-    if is_complex_request(prompt):
-
-        return POWERFUL_MODEL
-
-
-    # Normal coding requests
-    if is_coding_request(prompt):
-
-        return FAST_MODEL
-
-
-    # Normal conversation
-    return CHAT_MODEL
-
-
-# ============================================================
-# GET AVAILABLE MODELS
-# ============================================================ 
-
-def get_available_models():
+    names: List[str] = []
 
     try:
+        result = _client.list()
 
-        result = ollama.list()
+        # ollama-python changed its return shape between versions,
+        # so handle both the object form and the dict form.
+        raw = getattr(result, "models", None)
 
-        installed = []
+        if raw is None and isinstance(result, dict):
+            raw = result.get("models", [])
 
-        # New Ollama Python API
-        if hasattr(result, "models"):
+        for item in raw or []:
+            name = (
+                getattr(item, "model", None)
+                or getattr(item, "name", None)
+                or (item.get("model") or item.get("name") if isinstance(item, dict) else None)
+            )
 
-            for model in result.models:
+            if name:
+                names.append(str(name))
 
-                name = getattr(
-                    model,
-                    "model",
-                    None
-                )
+        names = list(dict.fromkeys(names))
 
-                if name:
-                    installed.append(name)
+    except Exception as error:  # Ollama down, wrong host, etc.
+        print(f"[vov] could not list Ollama models: {error}")
+        names = []
 
-        # Remove duplicates
-        installed = list(
-            dict.fromkeys(installed)
+    with _cache_lock:
+        _model_cache["at"] = time.time()
+
+        if names:
+            _model_cache["models"] = names
+
+    return names
+
+
+def is_online() -> bool:
+    try:
+        _client.list()
+        return True
+    except Exception:
+        return False
+
+
+def is_vision_model(name: str) -> bool:
+    lowered = (name or "").lower()
+    return any(hint in lowered for hint in config.VISION_HINTS)
+
+
+def _match(wanted: str, available: List[str]) -> Optional[str]:
+    """Best-effort match of a wanted model against installed ones."""
+
+    if not wanted:
+        return None
+
+    wanted = wanted.strip()
+    lowered = wanted.lower()
+
+    for name in available:
+        if name.lower() == lowered:
+            return name
+
+    # "qwen2.5-coder" should match "qwen2.5-coder:7b"
+    for name in available:
+        if name.lower().split(":")[0] == lowered.split(":")[0]:
+            return name
+
+    for name in available:
+        if lowered in name.lower():
+            return name
+
+    return None
+
+
+def resolve_model(wanted: str, prefer_vision: bool = False) -> str:
+    """
+    Turn a requested model name into one that actually exists.
+
+    Falls back through the configured defaults and then through
+    config.FALLBACK_MODELS. Raises only when Ollama has nothing at all.
+    """
+
+    available = installed_models()
+
+    if not available:
+        raise RuntimeError(
+            "No models are installed in Ollama. "
+            "Run `ollama pull qwen2.5:3b` and try again."
         )
 
+    if prefer_vision:
+        match = _match(config.VISION_MODEL, available)
 
-        return {
+        if match:
+            return match
 
-            "auto": True,
+        for name in available:
+            if is_vision_model(name):
+                return name
 
-            "installed": installed,
+        # No multimodal model installed; caller drops the images.
 
-            "chat": CHAT_MODEL,
+    match = _match(wanted, available)
 
-            "fast": FAST_MODEL,
+    if match:
+        return match
 
-            "powerful": POWERFUL_MODEL
+    for candidate in (
+        config.FAST_MODEL,
+        config.CHAT_MODEL,
+        config.POWERFUL_MODEL,
+        *config.FALLBACK_MODELS,
+    ):
+        match = _match(candidate, available)
 
-        }
+        if match:
+            return match
+
+    return available[0]
 
 
-    except Exception as e:
+def select_model(
+    prompt: str,
+    requested_model: str = "auto",
+    has_images: bool = False,
+) -> str:
+    """Pick a model for this prompt, honouring an explicit choice."""
 
-        print(
-            "Ollama model list error:",
-            e
+    requested = (requested_model or "auto").lower().strip()
+
+    if has_images:
+        return resolve_model(
+            requested if requested != "auto" else config.VISION_MODEL,
+            prefer_vision=True,
         )
 
-        return {
+    if requested != "auto":
+        return resolve_model(requested)
 
-            "auto": True,
+    if is_complex_request(prompt):
+        return resolve_model(config.POWERFUL_MODEL)
 
-            "installed": [],
+    if is_coding_request(prompt):
+        return resolve_model(config.FAST_MODEL)
 
-            "chat": CHAT_MODEL,
-
-            "fast": FAST_MODEL,
-
-            "powerful": POWERFUL_MODEL
-
-        }
+    return resolve_model(config.CHAT_MODEL)
 
 
-# ============================================================
-# NORMAL ASK
-# ============================================================
+def get_available_models() -> dict:
+    available = installed_models()
 
-def ask_model(
-    prompt,
-    model="auto",
-    return_model=False
-):
-
-    # --------------------------------------------------------
-    # SELECT MODEL
-    # --------------------------------------------------------
-
-    selected_model = select_model(
-        prompt,
-        model
-    )
+    return {
+        "auto": True,
+        "online": bool(available),
+        "installed": available,
+        "vision": [name for name in available if is_vision_model(name)],
+        "chat": config.CHAT_MODEL,
+        "fast": config.FAST_MODEL,
+        "powerful": config.POWERFUL_MODEL,
+        "vision_default": config.VISION_MODEL,
+        "host": config.OLLAMA_HOST,
+    }
 
 
-    # --------------------------------------------------------
-    # ASK OLLAMA
-    # --------------------------------------------------------
+# ------------------------------------------------------------------
+# Message building
+# ------------------------------------------------------------------
 
-    response = ollama.chat(
-
-        model=selected_model,
-
-        messages=[
-
-            {
-                "role": "system",
-                "content": SYSTEM_PROMPT
-            },
-
-            {
-                "role": "user",
-                "content": prompt
-            }
-
-        ],
-
-        options={
-
-            "temperature": 0.7,
-
-            "top_p": 0.9
-
-        }
-
-    )
-
-
-    # --------------------------------------------------------
-    # GET ANSWER
-    # --------------------------------------------------------
-
-    answer = response[
-        "message"
-    ][
-        "content"
+def build_messages(
+    prompt: str,
+    history: Optional[List[dict]] = None,
+    images: Optional[List[str]] = None,
+    system: Optional[str] = None,
+) -> List[dict]:
+    messages: List[dict] = [
+        {"role": "system", "content": system or SYSTEM_PROMPT}
     ]
 
+    for turn in (history or [])[-config.MAX_HISTORY_TURNS:]:
+        role = turn.get("role")
+        content = turn.get("content")
 
-    # --------------------------------------------------------
-    # RETURN MODEL INFORMATION
-    # --------------------------------------------------------
+        if role in ("user", "assistant") and content:
+            messages.append({"role": role, "content": str(content)})
+
+    user_message: dict = {"role": "user", "content": prompt}
+
+    if images:
+        # Ollama wants raw base64 without the data-url prefix.
+        cleaned = []
+
+        for image in images:
+            if not image:
+                continue
+
+            if "," in image and image.strip().startswith("data:"):
+                image = image.split(",", 1)[1]
+
+            cleaned.append(image.strip())
+
+        if cleaned:
+            user_message["images"] = cleaned
+
+    messages.append(user_message)
+
+    return messages
+
+
+def _options() -> dict:
+    return {
+        "temperature": config.TEMPERATURE,
+        "top_p": config.TOP_P,
+        "num_ctx": config.NUM_CTX,
+    }
+
+
+def _friendly_error(error: Exception) -> str:
+    text = str(error)
+
+    if "connection" in text.lower() or "refused" in text.lower():
+        return (
+            f"Cannot reach Ollama at {config.OLLAMA_HOST}. "
+            "Start it with `ollama serve` and try again."
+        )
+
+    if "not found" in text.lower() and "model" in text.lower():
+        return f"{text}. Pull it first with `ollama pull <model>`."
+
+    return text
+
+
+# ------------------------------------------------------------------
+# Blocking call
+# ------------------------------------------------------------------
+
+def ask_model(
+    prompt: str,
+    model: str = "auto",
+    history: Optional[List[dict]] = None,
+    images: Optional[List[str]] = None,
+    system: Optional[str] = None,
+    return_model: bool = False,
+):
+    selected = select_model(prompt, model, has_images=bool(images))
+
+    if images and not is_vision_model(selected):
+        images = None  # No multimodal model available; send text only.
+
+    messages = build_messages(prompt, history, images, system)
+
+    try:
+        response = _client.chat(
+            model=selected,
+            messages=messages,
+            options=_options(),
+        )
+
+    except Exception as error:
+        raise RuntimeError(_friendly_error(error)) from error
+
+    message = getattr(response, "message", None)
+
+    if message is None and isinstance(response, dict):
+        message = response.get("message", {})
+
+    answer = (
+        getattr(message, "content", None)
+        or (message.get("content") if isinstance(message, dict) else None)
+        or ""
+    )
 
     if return_model:
-
-        return {
-
-            "response": answer,
-
-            "model": selected_model
-
-        }
-
+        return {"response": answer, "model": selected}
 
     return answer
 
 
-# ============================================================
-# STREAM MODEL
-# ============================================================
+# ------------------------------------------------------------------
+# Streaming call
+# ------------------------------------------------------------------
+
+def _start_stream(model: str, messages: List[dict], think: bool):
+    kwargs = {
+        "model": model,
+        "messages": messages,
+        "stream": True,
+        "options": _options(),
+    }
+
+    if think:
+        kwargs["think"] = True
+
+    return _client.chat(**kwargs)
+
 
 def stream_model(
-    prompt,
-    model="auto"
-):
+    prompt: str,
+    model: str = "auto",
+    history: Optional[List[dict]] = None,
+    images: Optional[List[str]] = None,
+    system: Optional[str] = None,
+    should_stop=None,
+) -> Generator[dict, None, None]:
+    """
+    Yield {"type": thinking|content|done|error, "content": str, "model": str}.
 
-    # --------------------------------------------------------
-    # SELECT MODEL
-    # --------------------------------------------------------
-
-    selected_model = select_model(
-        prompt,
-        model
-    )
-
+    `should_stop` is an optional callable checked between chunks so the
+    HTTP layer can abort a runaway generation.
+    """
 
     try:
+        selected = select_model(prompt, model, has_images=bool(images))
 
-        # ----------------------------------------------------
-        # START OLLAMA STREAM
-        # ----------------------------------------------------
+    except Exception as error:
+        yield {"type": "error", "content": _friendly_error(error), "model": model}
+        yield {"type": "done", "content": "", "model": model}
+        return
 
-        stream = ollama.chat(
+    if images and not is_vision_model(selected):
+        images = None
 
-            model=selected_model,
+    messages = build_messages(prompt, history, images, system)
 
-            messages=[
+    want_think = selected not in _no_think
 
-                {
-                    "role": "system",
-                    "content": SYSTEM_PROMPT
-                },
+    try:
+        try:
+            stream = _start_stream(selected, messages, want_think)
 
-                {
-                    "role": "user",
-                    "content": prompt
-                }
+        except TypeError:
+            # Installed ollama-python predates the `think` argument.
+            _no_think.add(selected)
+            stream = _start_stream(selected, messages, False)
 
-            ],
-
-            stream=True,
-
-            think=True,
-
-            options={
-
-                "temperature": 0.7,
-
-                "top_p": 0.9
-
-            }
-
-        )
-
-
-        # ----------------------------------------------------
-        # PROCESS STREAM
-        # ----------------------------------------------------
+        except Exception as error:
+            if want_think and "think" in str(error).lower():
+                _no_think.add(selected)
+                stream = _start_stream(selected, messages, False)
+            else:
+                raise
 
         for chunk in stream:
+            if should_stop and should_stop():
+                yield {"type": "stopped", "content": "", "model": selected}
+                break
 
-            # Ollama Python objects can behave
-            # differently between versions.
+            message = getattr(chunk, "message", None)
 
-            if hasattr(
-                chunk,
-                "message"
-            ):
+            if message is None and isinstance(chunk, dict):
+                message = chunk.get("message", {})
 
-                message = chunk.message 
+            if message is None:
+                continue
 
-                thinking = getattr(
-                    message,
-                    "thinking",
-                    None
-                )
-
-                content = getattr(
-                    message,
-                    "content",
-                    None
-                )
-
+            if isinstance(message, dict):
+                thinking = message.get("thinking")
+                content = message.get("content")
             else:
-
-                message = chunk.get(
-                    "message",
-                    {}
-                )
-
-                thinking = message.get(
-                    "thinking"
-                )
-
-                content = message.get(
-                    "content"
-                )
-
-
-            # ------------------------------------------------
-            # THINKING
-            # ------------------------------------------------
+                thinking = getattr(message, "thinking", None)
+                content = getattr(message, "content", None)
 
             if thinking:
-
-                yield {
-
-                    "type": "thinking",
-
-                    "content": thinking,
-
-                    "model": selected_model
-
-                }
-
-
-            # ------------------------------------------------ 
-            # ANSWER
-            # ------------------------------------------------
+                yield {"type": "thinking", "content": thinking, "model": selected}
 
             if content:
+                yield {"type": "content", "content": content, "model": selected}
 
-                yield {
+    except Exception as error:
+        yield {"type": "error", "content": _friendly_error(error), "model": selected}
 
-                    "type": "content",
-
-                    "content": content,
-
-                    "model": selected_model
-
-                }
-
-
-    except Exception as e:
-
-        yield {
-
-            "type": "error",
-
-            "content": str(e),
-
-            "model": selected_model
-
-        }
+    yield {"type": "done", "content": "", "model": selected}

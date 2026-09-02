@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+vov_ai.db
+generated_projects/*/
+!generated_projects/.gitkeep

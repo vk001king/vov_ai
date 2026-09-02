@@ -1,180 +1,159 @@
+"""
+VOV AI - Project generation and modification.
+
+Improvements over the original:
+  * File parsing tolerates markdown fences and several common formats
+    the model drifts into, instead of failing outright.
+  * One automatic reformat retry when the first response is unparseable.
+  * The generated project is validated, and optionally auto repaired.
+  * Cancellation is honoured between files.
+  * Project context is length capped so large projects still work.
+"""
+
 import re
-from pathlib import Path
+from typing import List, Optional
 
-from ollama_engine import ask_model, select_model
-
-from project_manager import (
-    create_project,
-    create_file,
-    read_project,
-    project_exists
-)
-
+import config
 from build_status import (
-    start_build,
-    update_status,
+    add_error,
+    cancel_requested,
     file_completed,
     finish_build,
-    add_error
+    log,
+    set_model,
+    start_build,
+    update_status,
+)
+from ollama_engine import ask_model, select_model
+from project_manager import (
+    create_file,
+    create_project,
+    get_project_context,
+    project_exists,
+    read_project,
+)
+from project_tester import test_project
+
+BASE_DIR = config.PROJECTS_DIR
+
+
+# ==================================================================
+# Response parsing
+# ==================================================================
+
+_FILE_BLOCK = re.compile(
+    r"===\s*FILE:\s*(?P<name>.+?)\s*===\s*\n(?P<body>.*?)(?:\n\s*===\s*END\s*FILE\s*===|\Z)",
+    re.DOTALL | re.IGNORECASE,
+)
+
+_FENCE_WITH_NAME = re.compile(
+    r"(?:^|\n)(?:#{1,4}\s*)?(?:File:\s*)?[`*\s]*(?P<name>[\w./-]+\.[a-zA-Z0-9]{1,5})[`*\s]*:?\s*\n+"
+    r"```[a-zA-Z0-9+#-]*\s*\n(?P<body>.*?)```",
+    re.DOTALL,
 )
 
 
-# ============================================================
-# DIRECTORIES
-# ============================================================
+def _strip_fences(text: str) -> str:
+    text = text.strip()
 
-BASE_DIR = Path(__file__).parent / "generated_projects"
+    match = re.match(r"^```[a-zA-Z0-9+#-]*\s*\n(.*?)\n?```$", text, re.DOTALL)
+
+    if match:
+        return match.group(1).strip()
+
+    return text
 
 
-# ============================================================
-# FILE EXTRACTION
-# ============================================================
+def _clean_name(name: str) -> str:
+    name = name.strip().strip("`*\"' ")
+    name = name.replace("\\", "/").lstrip("/")
+    name = re.sub(r"^(?:file|filename|path)\s*[:=]\s*", "", name, flags=re.IGNORECASE)
 
-def extract_files(response):
+    return name.strip()
+
+
+def extract_files(response: str) -> List[dict]:
     """
-    Extract files from the AI response.
+    Pull files out of a model response.
 
-    Expected format:
+    Primary format:
+        ===FILE: index.html===
+        ...
+        ===END FILE===
 
-    ===FILE: index.html===
-    code
-    ===END FILE===
+    Falls back to fenced code blocks preceded by a filename, which is
+    what smaller models tend to produce when they forget the format.
     """
 
-    pattern = r"===FILE:\s*(.*?)===\s*\n(.*?)\s*===END FILE==="
+    files: List[dict] = []
+    seen: set = set()
 
-    matches = re.findall(
-        pattern,
-        response,
-        re.DOTALL | re.IGNORECASE
-    )
+    for match in _FILE_BLOCK.finditer(response or ""):
+        name = _clean_name(match.group("name"))
+        body = _strip_fences(match.group("body"))
 
-    files = []
+        if name and body and name not in seen:
+            seen.add(name)
+            files.append({"name": name, "content": body})
 
-    for filename, content in matches:
+    if files:
+        return files
 
-        filename = filename.strip()
-        content = content.strip()
+    for match in _FENCE_WITH_NAME.finditer(response or ""):
+        name = _clean_name(match.group("name"))
+        body = match.group("body").strip()
 
-        if filename and content:
-
-            files.append({
-                "name": filename,
-                "content": content
-            })
+        if name and body and name not in seen:
+            seen.add(name)
+            files.append({"name": name, "content": body})
 
     return files
 
 
-# ============================================================
-# LANGUAGE DETECTION
-# ============================================================
+# ==================================================================
+# Request analysis
+# ==================================================================
 
-def detect_language(request):
+LANGUAGE_PATTERNS = [
+    ("react", r"\breact(?:js|\.js)?\b"),
+    ("typescript", r"\btypescript\b|\bts\b"),
+    ("python", r"\bpython\b|\bflask\b|\bdjango\b|\bfastapi\b"),
+    ("node", r"\bnode(?:js|\.js)?\b|\bexpress\b"),
+    ("java", r"\bjava\b(?!script)"),
+    ("c++", r"\bc\+\+\b|\bcpp\b"),
+    ("c#", r"\bc#\b|\bcsharp\b|\bdotnet\b"),
+    ("php", r"\bphp\b|\blaravel\b"),
+    ("javascript", r"\bjavascript\b|\bvanilla js\b|\bjs\b"),
+    ("html", r"\bhtml\b|\bcss\b|\bstatic site\b"),
+]
 
-    text = request.lower()
 
-    languages = {
+def detect_language(request: str) -> str:
+    text = (request or "").lower()
 
-        "python": [
-            "only python",
-            "use only python",
-            "use python",
-            "python",
-            "python program",
-            "python app",
-            "python application"
-        ],
-
-        "javascript": [
-            "only javascript",
-            "use only javascript",
-            "use javascript",
-            "javascript",
-            "javascript app",
-            "js"
-        ],
-
-        "typescript": [
-            "only typescript",
-            "use typescript",
-            "typescript",
-            "typescript app",
-            "ts"
-        ],
-
-        "react": [
-            "only react",
-            "use react",
-            "react",
-            "reactjs",
-            "react.js"
-        ],
-
-        "html": [
-            "only html",
-            "use html",
-            "html",
-            "html css",
-            "html website"
-        ],
-
-        "java": [
-            "only java",
-            "use java",
-            "java"
-        ],
-
-        "c++": [
-            "only c++",
-            "use c++",
-            "c++"
-        ],
-
-        "c": [
-            "only c programming",
-            "use c programming",
-            "c programming"
-        ],
-
-        "php": [
-            "only php",
-            "use php",
-            "php"
-        ],
-
-        "node": [
-            "only node",
-            "use node",
-            "node",
-            "nodejs",
-            "node.js"
-        ]
-    }
-
-    for language, keywords in languages.items():
-
-        for keyword in keywords:
-
-            if keyword in text:
-
-                return language
+    for language, pattern in LANGUAGE_PATTERNS:
+        if re.search(pattern, text):
+            return language
 
     return "auto"
 
 
-# ============================================================
-# PROJECT TYPE
-# ============================================================
-
-def detect_project_type(request):
-
-    text = request.lower()
+def detect_project_type(request: str) -> str:
+    text = (request or "").lower()
 
     if "react" in text:
         return "React application"
 
-    if "website" in text:
+    if "api" in text or "backend" in text:
+        return "backend service"
+
+    if "game" in text:
+        return "browser game"
+
+    if "dashboard" in text:
+        return "dashboard"
+
+    if "website" in text or "landing page" in text or "portfolio" in text:
         return "website"
 
     if "web app" in text:
@@ -189,201 +168,114 @@ def detect_project_type(request):
     return "software project"
 
 
-# ============================================================
-# MODIFICATION DETECTION
-# ============================================================
-
-def is_modification_request(request):
-
-    text = request.lower()
-
-    modification_words = [
-
-        "change",
-        "modify",
-        "update",
-        "edit",
-        "add",
-        "remove",
-        "delete",
-        "replace",
-        "improve",
-        "fix",
-        "redesign",
-        "adjust",
-        "rename",
-        "include",
-        "make it",
-        "make the",
-        "add a",
-        "add an"
-    ]
-
-    for word in modification_words:
-
-        if word in text:
-
-            return True
-
-    return False
+MODIFICATION_WORDS = [
+    "change", "modify", "update", "edit", "add ", "remove", "delete",
+    "replace", "improve", "fix", "redesign", "adjust", "rename",
+    "include", "make it", "make the", "instead of", "also ",
+    "convert", "refactor", "enhance", "extend",
+]
 
 
-# ============================================================
-# EXISTING PROJECT
-# ============================================================
+def is_modification_request(request: str) -> bool:
+    text = (request or "").lower()
 
-def get_existing_files(project_name):
-
-    if not project_exists(project_name):
-
-        return {}
-
-    return read_project(
-        project_name
-    )
+    return any(word in text for word in MODIFICATION_WORDS)
 
 
-# ============================================================
-# GENERATION PROMPT
-# ============================================================
+# ==================================================================
+# Prompt
+# ==================================================================
+
+OUTPUT_CONTRACT = """
+============================================================
+OUTPUT FORMAT - THIS IS MANDATORY
+============================================================
+
+Return ONLY project files, each wrapped exactly like this:
+
+===FILE: index.html===
+<complete file contents>
+===END FILE===
+
+===FILE: style.css===
+<complete file contents>
+===END FILE===
+
+Rules for the output:
+
+- No explanations before or after the files.
+- No markdown code fences.
+- No JSON wrapper.
+- No partial files or diffs. Every file must be complete.
+- Use forward slashes in paths, relative to the project root.
+- Never use absolute paths or "..".
+"""
+
 
 def build_generation_prompt(
-    user_request,
-    selected_model,
-    existing_files=None
-):
-
-    language = detect_language(
-        user_request
-    )
-
-    project_type = detect_project_type(
-        user_request
-    )
-
-    existing_files = existing_files or {}
-
-
-    # ========================================================
-    # LANGUAGE
-    # ========================================================
+    user_request: str,
+    selected_model: str,
+    project_name: str,
+    existing_context: Optional[str] = None,
+) -> str:
+    language = detect_language(user_request)
+    project_type = detect_project_type(user_request)
 
     if language != "auto":
-
-        language_instruction = f"""
-The user explicitly requested:
-
-{language}
-
-You MUST use this technology.
-
-Do NOT replace it with another programming language
-or framework.
-"""
-
+        language_instruction = (
+            f"The user explicitly asked for {language}. You MUST use it. "
+            "Do not substitute another language or framework."
+        )
     else:
+        language_instruction = (
+            "The user did not name a language. Choose the most suitable one "
+            "for the request, favouring simplicity and something that runs "
+            "in a browser with no build step unless the request demands more."
+        )
 
-        language_instruction = """
-The user did not specify a programming language.
+    if existing_context:
+        project_section = f"""
+============================================================
+EXISTING PROJECT - MODIFY IT
+============================================================
 
-Choose the best technology automatically.
+This project already exists. The user wants changes made to it.
 
-Consider:
+Read the files below carefully, then:
 
-- requirements
-- performance
-- simplicity
-- maintainability
-- browser compatibility
-- functionality
-- scalability
+- Preserve every existing feature unless asked to remove it.
+- Preserve the existing design unless asked to change it.
+- Change only what the request requires.
+- Return the COMPLETE contents of every file you touch.
+- Do not return files you did not change.
+- Keep every reference valid: each src, href and import must resolve.
+
+Current files:
+
+{existing_context}
 """
-
-
-    # ========================================================
-    # EXISTING PROJECT
-    # ========================================================
-
-    if existing_files:
-
-        existing_section = """
-============================================================
-EXISTING PROJECT
-============================================================
-
-This project already exists.
-
-The user wants to modify the existing project.
-
-Read and understand the existing files carefully.
-
-IMPORTANT:
-
-- Preserve existing functionality.
-- Do not unnecessarily rewrite unrelated files.
-- Do not remove existing features.
-- Do not break existing APIs.
-- Do not break existing links.
-- Do not break existing JavaScript.
-- Do not break existing CSS.
-- Only change what is required.
-- Add new files only when necessary.
-- Return complete contents of every file you modify.
-
-Existing files:
-
-"""
-
-        for filename, content in existing_files.items():
-
-            existing_section += f"""
-
-============================================================
-FILE: {filename}
-============================================================
-
-{content}
-
-============================================================
-END FILE
-============================================================
-
-"""
-
     else:
-
-        existing_section = """
+        project_section = """
 ============================================================
 NEW PROJECT
 ============================================================
 
-This is a new project.
+This is a brand new project. Build it completely from scratch.
 
-Create the complete project from scratch.
+For a website, produce at minimum index.html, style.css and script.js,
+each linked correctly from the HTML.
 """
 
-
-    # ========================================================
-    # PROMPT
-    # ========================================================
-
-    return f"""
-You are VOV AI, an advanced autonomous software development
-agent.
-
-You create and modify complete working software projects.
+    return f"""You are VOV AI, an autonomous software development agent.
+You create and modify complete, working software projects.
 
 ============================================================
-SELECTED MODEL
+PROJECT
 ============================================================
 
-{selected_model}
-
-============================================================
-PROJECT TYPE
-============================================================
-
-{project_type}
+Name: {project_name}
+Type: {project_type}
+Model: {selected_model}
 
 ============================================================
 USER REQUEST
@@ -397,562 +289,271 @@ LANGUAGE
 
 {language_instruction}
 
-{existing_section}
+{project_section}
 
 ============================================================
-FUNCTIONALITY
+QUALITY REQUIREMENTS
 ============================================================
 
-Create a complete and functional implementation.
+- Every feature you claim to build must actually work.
+- No dead buttons, fake forms, or simulated behaviour.
+- No placeholders: no TODO, YOUR CODE HERE, ADD CODE HERE, or "...".
+- Handle errors and empty states.
+- Interfaces must be modern, responsive and keyboard accessible.
+- Use semantic HTML and meaningful names.
+- Include a <title>, a viewport meta tag, and sensible defaults.
 
-Every requested feature must actually work.
-
-Do not create fake buttons.
-
-Do not create fake forms.
-
-Do not create fake functionality.
-
-Do not use placeholders.
-
-Do not use:
-
-TODO
-
-YOUR CODE HERE
-
-ADD CODE HERE
-
-PLACEHOLDER
-
-...
-
-============================================================
-MODIFICATION RULES
-============================================================
-
-If this is an existing project:
-
-1. Understand the existing project.
-
-2. Find the files related to the request.
-
-3. Modify only what is necessary.
-
-4. Preserve existing functionality.
-
-5. Preserve existing design unless asked to change it.
-
-6. Preserve existing APIs.
-
-7. Preserve existing features.
-
-8. Add new files when necessary.
-
-9. Remove files only when explicitly requested.
-
-10. Make sure all references are valid.
-
-11. Make sure every imported file exists.
-
-12. Make sure every HTML, CSS and JavaScript reference works.
-
-13. Return COMPLETE files, not partial snippets.
-
-============================================================
-WEBSITE RULES
-============================================================
-
-For normal websites use:
-
-HTML
-CSS
-JavaScript
-
-unless another technology is explicitly requested.
-
-The interface should be:
-
-- modern
-- attractive
-- responsive
-- accessible
-- interactive
-- functional
-
-============================================================
-CODE QUALITY
-============================================================
-
-Write clean and maintainable code.
-
-Use meaningful variable names.
-
-Avoid unnecessary duplication.
-
-Handle errors properly.
-
-Make sure the project can actually run.
-
-============================================================
-OUTPUT FORMAT
-============================================================
-
-Return ONLY project files.
-
-Use exactly:
-
-===FILE: filename===
-
-complete file contents
-
-===END FILE===
-
-Example:
-
-===FILE: index.html===
-<!DOCTYPE html>
-
-<html>
-...
-</html>
-===END FILE===
-
-===FILE: style.css===
-body {{
-    margin: 0;
-}}
-===END FILE===
-
-===FILE: script.js===
-console.log("VOV AI");
-===END FILE===
-
-============================================================
-OUTPUT RULES
-============================================================
-
-Do NOT return explanations.
-
-Do NOT return Markdown code fences.
-
-Do NOT return JSON.
-
-Do NOT return commentary.
-
-Do NOT return partial files.
-
-Return complete files.
-
-Before returning, verify:
-
-- syntax
-- imports
-- references
-- requested features
-- existing features
-- dependencies
-- HTML
-- CSS
-- JavaScript
-
-Then return ONLY the files.
+{OUTPUT_CONTRACT}
 """
 
 
-# ============================================================
-# GENERATE / MODIFY PROJECT
-# ============================================================
+REFORMAT_PROMPT = """Your previous answer was not in the required format,
+so none of it could be saved.
+
+Return the SAME project again, changing nothing about the code itself,
+but wrapping every file exactly like this:
+
+===FILE: path/name.ext===
+<complete file contents>
+===END FILE===
+
+No explanations. No markdown fences. Files only.
+
+Your previous answer was:
+
+{previous}
+"""
+
+
+# ==================================================================
+# Generation
+# ==================================================================
+
+def _write_files(project_name: str, files: List[dict]) -> List[str]:
+    created: List[str] = []
+    total = max(len(files), 1)
+
+    for index, item in enumerate(files, start=1):
+        if cancel_requested(project_name):
+            break
+
+        filename = _clean_name(item["name"])
+        content = item["content"]
+
+        if not filename:
+            continue
+
+        progress = 40 + int((index / total) * 45)
+
+        update_status(
+            project_name,
+            "writing",
+            f"Writing {filename}...",
+            filename,
+            progress,
+        )
+
+        try:
+            create_file(project_name, filename, content)
+        except ValueError as error:
+            add_error(project_name, str(error))
+            continue
+
+        file_completed(project_name, filename)
+        created.append(filename)
+
+    return created
+
 
 def generate_project(
-    project_name,
-    user_request,
-    requested_model="auto",
-    mode="auto"
-):
+    project_name: str,
+    user_request: str,
+    requested_model: str = "auto",
+    mode: str = "auto",
+    auto_fix: bool = True,
+) -> dict:
+    """Build or modify a project. Runs in a background thread."""
 
-    start_build(
-        project_name
-    )
+    start_build(project_name, model=requested_model, mode=mode)
 
-    update_status(
-        project_name,
-        "thinking",
-        "Understanding your request..."
-    )
+    update_status(project_name, "thinking", "Understanding your request...", progress=5)
 
     try:
+        mode = (mode or "auto").lower().strip()
 
-        # ====================================================
-        # EXISTING PROJECT
-        # ====================================================
-
-        existing_files = get_existing_files(
-            project_name
-        )
-
-
-        # ====================================================
-        # NORMALIZE MODE
-        # ====================================================
-
-        mode = (
-            mode or "auto"
-        ).lower().strip()
-
-
-        if mode not in [
-            "auto",
-            "create",
-            "modify"
-        ]:
-
+        if mode not in ("auto", "create", "modify"):
             mode = "auto"
 
-
-        # ====================================================
-        # DECIDE CREATE / MODIFY
-        # ====================================================
+        existing = read_project(project_name) if project_exists(project_name) else {}
 
         if mode == "create":
-
             modifying = False
-
         elif mode == "modify":
-
-            modifying = bool(
-                existing_files
-            )
-
+            modifying = bool(existing)
         else:
+            modifying = bool(existing) and is_modification_request(user_request)
 
-            modifying = (
-                bool(existing_files)
-                and
-                is_modification_request(
-                    user_request
-                )
-            )
+        # ----------------------------------------------------------
+        # Model
+        # ----------------------------------------------------------
 
+        update_status(project_name, "planning", "Selecting a model...", progress=10)
 
-        # ====================================================
-        # MODEL
-        # ====================================================
+        selected_model = select_model(user_request, requested_model)
+        set_model(project_name, selected_model)
 
         update_status(
             project_name,
             "planning",
-            "Selecting the best AI model..."
+            f"Using {selected_model} to {'modify' if modifying else 'create'} {project_name}.",
+            progress=15,
         )
-
-        selected_model = select_model(
-            user_request,
-            requested_model
-        )
-
-
-        update_status(
-            project_name,
-            "planning",
-            f"Using {selected_model}..."
-        )
-
-
-        # ====================================================
-        # MODE STATUS
-        # ====================================================
 
         if modifying:
-
             update_status(
                 project_name,
                 "reading",
-                "Reading existing project..."
+                f"Reading {len(existing)} existing file(s)...",
+                progress=20,
             )
 
-            update_status(
-                project_name,
-                "planning",
-                "Planning requested changes..."
-            )
-
-        else:
-
-            update_status(
-                project_name,
-                "planning",
-                "Planning new project..."
-            )
-
-
-        # ====================================================
-        # BUILD PROMPT
-        # ====================================================
+        context = get_project_context(project_name) if modifying else None
 
         prompt = build_generation_prompt(
-
             user_request,
-
             selected_model,
-
-            existing_files if modifying else None
-
+            project_name,
+            context,
         )
 
+        if cancel_requested(project_name):
+            finish_build(project_name, False, "Build cancelled.")
+            return {"project": project_name, "success": False, "error": "cancelled"}
 
-        # ====================================================
-        # AI GENERATION
-        # ====================================================
+        # ----------------------------------------------------------
+        # Generate
+        # ----------------------------------------------------------
 
         update_status(
             project_name,
             "generating",
-            f"{selected_model} is working..."
+            f"{selected_model} is writing code. This can take a while on a local model...",
+            progress=30,
         )
 
+        response = ask_model(prompt, selected_model)
 
-        response = ask_model(
-            prompt,
-            selected_model
-        )
+        files = extract_files(response)
 
-
-        # ====================================================
-        # EXTRACT FILES
-        # ====================================================
-
-        update_status(
-            project_name,
-            "processing",
-            "Processing generated files..."
-        )
-
-
-        files = extract_files(
-            response
-        )
-
-
+        # One retry if the model ignored the output contract.
         if not files:
-
-            raise ValueError(
-                "The AI did not return files in the expected format."
-            )
-
-
-        # ====================================================
-        # CREATE PROJECT
-        # ====================================================
-
-        create_project(
-            project_name
-        )
-
-
-        # ====================================================
-        # SAVE FILES
-        # ====================================================
-
-        created_files = []
-
-        for file_data in files:
-
-            filename = file_data["name"]
-
-            content = file_data["content"]
-
-
-            # ------------------------------------------------
-            # NORMALIZE PATH
-            # ------------------------------------------------
-
-            filename = filename.replace(
-                "\\",
-                "/"
-            )
-
-            path = Path(
-                filename
-            )
-
-
-            # ------------------------------------------------
-            # SECURITY
-            # ------------------------------------------------
-
-            if (
-                filename.startswith("/")
-                or
-                filename.startswith("\\")
-                or
-                ".." in path.parts
-            ):
-
-                add_error(
-                    project_name,
-                    f"Unsafe file path skipped: {filename}"
-                )
-
-                continue
-
-
-            # ------------------------------------------------
-            # STATUS
-            # ------------------------------------------------
+            log(project_name, "Response was not in the expected format. Asking for a reformat...")
 
             update_status(
-
                 project_name,
-
-                "generating_file",
-
-                f"Working on {filename}...",
-
-                filename
-
+                "generating",
+                "Reformatting the model's answer...",
+                progress=35,
             )
 
-
-            # ------------------------------------------------
-            # WRITE
-            # ------------------------------------------------
-
-            create_file(
-
-                project_name,
-
-                filename,
-
-                content
-
+            retry = ask_model(
+                REFORMAT_PROMPT.format(previous=response[:12000]),
+                selected_model,
             )
 
+            files = extract_files(retry)
 
-            # ------------------------------------------------
-            # COMPLETE
-            # ------------------------------------------------
-
-            file_completed(
-
-                project_name,
-
-                filename
-
-            )
-
-
-            created_files.append(
-                filename
-            )
-
-
-        # ====================================================
-        # VALIDATION
-        # ====================================================
-
-        if not created_files:
-
+        if not files:
             raise ValueError(
-                "No valid project files were created."
+                "The model did not return any files in a recognisable format. "
+                "Try a larger model, or rephrase the request."
             )
 
+        # ----------------------------------------------------------
+        # Write
+        # ----------------------------------------------------------
 
-        # ====================================================
-        # TEST
-        # ====================================================
+        create_project(project_name)
 
         update_status(
             project_name,
-            "testing",
-            "Checking generated project..."
+            "writing",
+            f"Saving {len(files)} file(s)...",
+            progress=40,
         )
 
+        created = _write_files(project_name, files)
 
-        # ====================================================
-        # SUCCESS
-        # ====================================================
+        if cancel_requested(project_name):
+            finish_build(project_name, False, "Build cancelled after partial write.")
+            return {"project": project_name, "files": created, "success": False, "error": "cancelled"}
 
-        if modifying:
+        if not created:
+            raise ValueError("No valid project files could be written.")
 
-            success_message = (
-                "Project modified successfully!"
+        # ----------------------------------------------------------
+        # Validate
+        # ----------------------------------------------------------
+
+        update_status(project_name, "testing", "Checking the generated project...", progress=90)
+
+        errors = test_project(project_name)
+
+        if errors and auto_fix:
+            update_status(
+                project_name,
+                "fixing",
+                f"Found {len(errors)} issue(s). Attempting automatic repair...",
+                progress=93,
             )
 
+            from project_fixer import fix_project  # Imported late to avoid a cycle.
+
+            result = fix_project(project_name, model=selected_model)
+
+            errors = result.get("errors", []) if not result.get("working") else []
+
+            for name in result.get("fixed_files", []):
+                if name not in created:
+                    created.append(name)
+
+        for error in errors:
+            add_error(project_name, error)
+
+        if errors:
+            finish_build(
+                project_name,
+                success=True,
+                message=f"Project built with {len(errors)} remaining warning(s).",
+            )
         else:
-
-            success_message = (
-                "Project generated successfully!"
+            finish_build(
+                project_name,
+                success=True,
+                message="Project modified successfully." if modifying else "Project generated successfully.",
             )
-
-
-        finish_build(
-
-            project_name,
-
-            success=True,
-
-            message=success_message
-
-        )
-
 
         return {
-
             "project": project_name,
-
-            "files": created_files,
-
+            "files": created,
             "model": selected_model,
-
-            "language": detect_language(
-                user_request
-            ),
-
+            "language": detect_language(user_request),
             "modified": modifying,
-
-            "mode": (
-                "modify"
-                if modifying
-                else "create"
-            ),
-
-            "success": True
-
+            "mode": "modify" if modifying else "create",
+            "warnings": errors,
+            "success": True,
         }
 
+    except Exception as error:  # noqa: BLE001 - surfaced to the user
+        message = str(error)
 
-    except Exception as e:
-
-        error_message = str(e)
-
-
-        add_error(
-            project_name,
-            error_message
-        )
-
-
-        finish_build(
-
-            project_name,
-
-            success=False,
-
-            message="Project generation failed."
-
-        )
-
+        add_error(project_name, message)
+        finish_build(project_name, success=False, message=f"Build failed: {message}")
 
         return {
-
             "project": project_name,
-
             "files": [],
-
             "model": requested_model,
-
             "success": False,
-
-            "error": error_message
-
+            "error": message,
         }
