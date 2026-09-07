@@ -8,6 +8,7 @@ or:
 """
 
 import json
+import time
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
@@ -40,6 +41,13 @@ from project_manager import (
 from project_tester import project_report
 
 store.init_db()
+
+# Status stream pacing. The window is generous because a build on a
+# local model can run for a long time; clients re-attach when it
+# closes, so it only caps how long one connection may sit open.
+STREAM_POLL_SECONDS = 0.5
+STREAM_KEEPALIVE_SECONDS = 15
+STREAM_MAX_SECONDS = 3600
 
 
 @asynccontextmanager
@@ -383,13 +391,13 @@ def download_project(project_name: str):
 def _finish_with_download(project_name: str, success: bool) -> None:
     """
     Runs after a background build (generate or fix) settles. On success
-    the zip is pre-built immediately so the download is instant and can
-    fire automatically the moment the client sees the build finish -
-    no separate "click to prepare" round trip.
+    the zip is cached immediately, so the download the client fires the
+    moment it sees the build finish is served from memory instead of
+    compressing the project on demand.
     """
 
-    if success and prebuild_zip(project_name):
-        build_status.mark_download_ready(project_name)
+    if success:
+        prebuild_zip(project_name)
 
 
 def _run_generate(
@@ -478,24 +486,31 @@ def cancel_build(project_name: str):
 def status_stream(project_name: str):
     """Server-sent-style stream of build status until the build ends."""
 
-    import time
-
     def generate():
         last = None
+        started = time.monotonic()
+        sent_at = 0.0
 
-        for _ in range(1800):  # ~15 minutes at 0.5s
+        while time.monotonic() - started < STREAM_MAX_SECONDS:
             current = build_status.get_status(project_name)
 
             payload = json.dumps(current, ensure_ascii=False)
+            now = time.monotonic()
 
-            if payload != last:
+            # A local model can think for minutes without changing the
+            # status. Repeating it on a slow heartbeat keeps the
+            # connection from looking dead to the browser, and lets a
+            # client that has gone away be noticed and dropped.
+            if payload != last or now - sent_at >= STREAM_KEEPALIVE_SECONDS:
                 yield payload + "\n"
+
                 last = payload
+                sent_at = now
 
             if current.get("finished"):
                 break
 
-            time.sleep(0.5)
+            time.sleep(STREAM_POLL_SECONDS)
 
     return StreamingResponse(
         generate(),
