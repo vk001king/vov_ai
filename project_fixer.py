@@ -13,7 +13,7 @@ import re
 from typing import List, Optional
 
 import config
-from build_status import log, update_status
+from build_status import cancel_requested, log, update_status
 from ollama_engine import ask_model, resolve_model
 from project_manager import create_file, project_exists, read_file, read_project
 from project_tester import test_project
@@ -121,6 +121,14 @@ def fix_project(
     previous_errors: Optional[List[str]] = None
 
     for attempt in range(1, attempts + 1):
+        if cancel_requested(project_name):
+            return {
+                "working": False,
+                "message": "Fix cancelled.",
+                "fixed_files": fixed_files,
+                "errors": previous_errors or [],
+            }
+
         errors = test_project(project_name)
 
         if not errors:
