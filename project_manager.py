@@ -19,6 +19,11 @@ BASE_DIR = config.PROJECTS_DIR
 
 SAFE_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
 
+# Pre-built zip bytes, keyed by project name. Populated right after a
+# build finishes so downloads are instant instead of re-walking and
+# re-compressing the project on every request. Invalidated on any write.
+_zip_cache: Dict[str, bytes] = {}
+
 
 # ------------------------------------------------------------------
 # Names and paths
@@ -105,6 +110,8 @@ def create_file(project_name: str, file_path: str, content: str) -> Path:
     full_path.parent.mkdir(parents=True, exist_ok=True)
     full_path.write_text(content, encoding="utf-8")
 
+    invalidate_zip_cache(project_name)
+
     return full_path
 
 
@@ -115,6 +122,8 @@ def delete_file(project_name: str, file_path: str) -> bool:
         return False
 
     full_path.unlink()
+
+    invalidate_zip_cache(project_name)
 
     return True
 
@@ -127,6 +136,8 @@ def delete_project(project_name: str) -> bool:
 
     shutil.rmtree(path)
 
+    invalidate_zip_cache(project_name)
+
     return True
 
 
@@ -138,6 +149,8 @@ def rename_project(project_name: str, new_name: str) -> bool:
         return False
 
     source.rename(target)
+
+    invalidate_zip_cache(project_name)
 
     return True
 
@@ -315,3 +328,41 @@ def zip_project(project_name: str) -> Optional[io.BytesIO]:
     buffer.seek(0)
 
     return buffer
+
+
+def invalidate_zip_cache(project_name: str) -> None:
+    _zip_cache.pop(project_name, None)
+
+
+def prebuild_zip(project_name: str) -> bool:
+    """
+    Zip the project now and cache the bytes, so the download endpoint
+    can serve it immediately instead of compressing on demand. Called
+    right after a build finishes.
+    """
+
+    buffer = zip_project(project_name)
+
+    if buffer is None:
+        return False
+
+    _zip_cache[project_name] = buffer.getvalue()
+
+    return True
+
+
+def zip_project_cached(project_name: str) -> Optional[bytes]:
+    cached = _zip_cache.get(project_name)
+
+    if cached is not None:
+        return cached
+
+    buffer = zip_project(project_name)
+
+    if buffer is None:
+        return None
+
+    data = buffer.getvalue()
+    _zip_cache[project_name] = data
+
+    return data

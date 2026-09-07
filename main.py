@@ -11,7 +11,7 @@ import json
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -31,10 +31,11 @@ from project_manager import (
     is_valid_project_name,
     list_project_files,
     list_projects,
+    prebuild_zip,
     project_exists,
     read_project,
     rename_project,
-    zip_project,
+    zip_project_cached,
 )
 from project_tester import project_report
 
@@ -360,13 +361,16 @@ def download_project(project_name: str):
     if not is_valid_project_name(project_name):
         raise HTTPException(400, "Invalid project name.")
 
-    buffer = zip_project(project_name)
+    # Served from the pre-built cache when a background build already
+    # prepared it (see _finish_with_download below), falling back to
+    # building it on the spot for a project downloaded cold.
+    data = zip_project_cached(project_name)
 
-    if buffer is None:
+    if data is None:
         raise HTTPException(404, "Project not found.")
 
-    return StreamingResponse(
-        buffer,
+    return Response(
+        content=data,
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="{project_name}.zip"'},
     )
@@ -375,6 +379,45 @@ def download_project(project_name: str):
 # ==================================================================
 # Build
 # ==================================================================
+
+def _finish_with_download(project_name: str, success: bool) -> None:
+    """
+    Runs after a background build (generate or fix) settles. On success
+    the zip is pre-built immediately so the download is instant and can
+    fire automatically the moment the client sees the build finish -
+    no separate "click to prepare" round trip.
+    """
+
+    if success and prebuild_zip(project_name):
+        build_status.mark_download_ready(project_name)
+
+
+def _run_generate(
+    project_name: str,
+    request: str,
+    model: str,
+    mode: str,
+    auto_fix: bool,
+) -> None:
+    result = generate_project(project_name, request, model, mode, auto_fix)
+    _finish_with_download(project_name, bool(result.get("success")))
+
+
+def _run_fix(project_name: str, model: Optional[str]) -> None:
+    try:
+        result = fix_project(project_name, model=model)
+    except Exception as error:  # noqa: BLE001
+        build_status.add_error(project_name, str(error))
+        build_status.finish_build(project_name, success=False, message=f"Fix failed: {error}")
+        return
+
+    build_status.finish_build(
+        project_name,
+        success=bool(result.get("working")),
+        message=result.get("message", "Fix finished."),
+    )
+    _finish_with_download(project_name, bool(result.get("working")))
+
 
 @app.post("/generate")
 def generate(body: ProjectRequest, background_tasks: BackgroundTasks):
@@ -392,11 +435,14 @@ def generate(body: ProjectRequest, background_tasks: BackgroundTasks):
     if mode not in ("auto", "create", "modify"):
         mode = "auto"
 
-    # Registered up front so the first status poll never 404s.
+    # Registered up front so the first status poll never 404s. The
+    # actual work happens in the background task below, entirely on
+    # the server: it keeps running regardless of whether the client
+    # stays connected, switches tabs, or closes the page.
     build_status.start_build(body.project_name, model=body.model, mode=mode)
 
     background_tasks.add_task(
-        generate_project,
+        _run_generate,
         body.project_name,
         body.request,
         body.model or "auto",
@@ -467,13 +513,34 @@ def test_existing_project(project_name: str):
 
 
 @app.post("/fix/{project_name}")
-def fix_existing_project(project_name: str, model: str = "auto"):
+def fix_existing_project(
+    project_name: str,
+    background_tasks: BackgroundTasks,
+    model: str = "auto",
+):
     if not project_exists(project_name):
         raise HTTPException(404, "Project not found.")
 
-    result = fix_project(project_name, model=None if model == "auto" else model)
+    if build_status.is_running(project_name):
+        raise HTTPException(409, "A build is already running for this project.")
 
-    return {"project": project_name, **result}
+    resolved_model = None if model == "auto" else model
+
+    # Registered up front so the first status poll never 404s, same as
+    # /generate. The fix loop can call the model several times, so it
+    # runs in the background instead of holding the HTTP request open:
+    # the response comes back immediately and the repair keeps going
+    # server-side no matter what the client does.
+    build_status.start_build(project_name, model=model, mode="fix")
+
+    background_tasks.add_task(_run_fix, project_name, resolved_model)
+
+    return {
+        "message": "Fix started.",
+        "project": project_name,
+        "model": model,
+        "working": True,
+    }
 
 
 # ==================================================================

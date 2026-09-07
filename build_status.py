@@ -38,6 +38,7 @@ def _blank(project_name: str) -> dict:
         "finished_at": None,
         "finished": False,
         "cancel_requested": False,
+        "download_ready": False,
     }
 
 
@@ -156,6 +157,19 @@ def finish_build(
     log(project_name, message)
 
 
+def mark_download_ready(project_name: str) -> None:
+    """
+    Flip on once the zip for a finished build has been pre-built, so
+    the frontend can auto-download without waiting on the archive to
+    be created on demand.
+    """
+
+    with _lock:
+        build = _builds.setdefault(project_name, _blank(project_name))
+        build["download_ready"] = True
+        build["updated_at"] = _now()
+
+
 def get_status(project_name: str) -> dict:
     with _lock:
         build = _builds.get(project_name)
@@ -177,6 +191,7 @@ def get_status(project_name: str) -> dict:
                 "finished_at": None,
                 "finished": True,
                 "cancel_requested": False,
+                "download_ready": False,
             }
 
         import copy
